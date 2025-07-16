@@ -1,161 +1,146 @@
-# src/agents/research_agent.py
-"""Main MCP agent for research tasks"""
-
-import asyncio
-from typing import Dict, List, Any, Optional
-from mcp import ClientSession, StdioServerTransport
-from mcp.types import Tool, TextContent, CallToolResult
+from typing import List, Dict, Any, Optional
 import json
-from dataclasses import dataclass
+import logging
+from datetime import datetime
+import asyncio
 
-@dataclass
-class ResearchQuery:
-    question: str
-    context: Optional[str] = None
-    sources: List[str] = None
-    depth: str = "medium"  # shallow, medium, deep
+# Import statements with proper error handling
+try:
+    from transformers import AutoTokenizer, AutoModel
+    from sentence_transformers import SentenceTransformer
+    import torch
+    import faiss
+    import numpy as np
+    import pandas as pd
+except ImportError as e:
+    logging.error(f"Failed to import required libraries: {e}")
+    raise
+
+class ModelManager:
+    def __init__(self):
+        self.models = {}
+        self.tokenizers = {}
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+    def load_model(self, model_name: str, model_type: str = "sentence-transformer"):
+        """Load a model based on type"""
+        try:
+            if model_type == "sentence-transformer":
+                model = SentenceTransformer(model_name)
+                model.to(self.device)
+                self.models[model_name] = model
+                return model
+            elif model_type == "transformers":
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                model = AutoModel.from_pretrained(model_name)
+                model.to(self.device)
+                self.tokenizers[model_name] = tokenizer
+                self.models[model_name] = model
+                return model
+        except Exception as e:
+            logging.error(f"Failed to load model {model_name}: {e}")
+            return None
+    
+    def get_model(self, model_name: str):
+        return self.models.get(model_name)
+    
+    def get_tokenizer(self, model_name: str):
+        return self.tokenizers.get(model_name)
+    
+    def list_models(self):
+        return list(self.models.keys())
+
+class VectorStore:
+    def __init__(self, dimension: int = 384):
+        self.dimension = dimension
+        self.index = faiss.IndexFlatL2(dimension)
+        self.documents = []
+        self.metadata = []
+        
+    def add_documents(self, documents: List[str], embeddings: np.ndarray, metadata: List[Dict] = None):
+        """Add documents with their embeddings to the vector store"""
+        self.index.add(embeddings.astype('float32'))
+        self.documents.extend(documents)
+        if metadata:
+            self.metadata.extend(metadata)
+        else:
+            self.metadata.extend([{}] * len(documents))
+    
+    def search(self, query_embedding: np.ndarray, k: int = 5):
+        """Search for similar documents"""
+        distances, indices = self.index.search(query_embedding.astype('float32'), k)
+        results = []
+        for i, idx in enumerate(indices[0]):
+            if idx < len(self.documents):
+                results.append({
+                    'document': self.documents[idx],
+                    'metadata': self.metadata[idx],
+                    'distance': distances[0][i],
+                    'similarity': 1 / (1 + distances[0][i])
+                })
+        return results
+    
+    def get_document_count(self):
+        return len(self.documents)
+    
+    def clear(self):
+        """Clear all documents from the vector store"""
+        self.index = faiss.IndexFlatL2(self.dimension)
+        self.documents = []
+        self.metadata = []
 
 class ResearchAgent:
-    """Main MCP agent for research tasks"""
+    def __init__(self):
+        self.model_manager = ModelManager()
+        self.vector_store = VectorStore()
+        self.logger = logging.getLogger(__name__)
+        
+    async def initialize(self):
+        """Initialize the research agent with default models"""
+        try:
+            # Load default embedding model
+            self.model_manager.load_model("all-MiniLM-L6-v2")
+            self.logger.info("Research Agent initialized successfully")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Research Agent: {e}")
+            return False
     
-    def __init__(self, model_manager: ModelManager, vector_store: VectorStore):
-        self.model_manager = model_manager
-        self.vector_store = vector_store
-        self.tools = self._initialize_tools()
-        
-    def _initialize_tools(self) -> List[Tool]:
-        """Initialize available tools"""
-        return [
-            Tool(
-                name="search_documents",
-                description="Search through uploaded research documents",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "num_results": {"type": "integer", "default": 5}
-                    },
-                    "required": ["query"]
-                }
-            ),
-            Tool(
-                name="web_search",
-                description="Search the web for additional information",
-                inputSchema={
-                    "type": "object", 
-                    "properties": {
-                        "query": {"type": "string"},
-                        "num_results": {"type": "integer", "default": 3}
-                    },
-                    "required": ["query"]
-                }
-            ),
-            Tool(
-                name="analyze_text",
-                description="Analyze text using fine-tuned model",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string"},
-                        "analysis_type": {"type": "string", "enum": ["summarize", "critique", "extract_key_points"]}
-                    },
-                    "required": ["text", "analysis_type"]
-                }
-            )
-        ]
-        
-    async def process_research_query(self, query: ResearchQuery) -> Dict[str, Any]:
-        """Process a research query using agentic workflow"""
-        workflow_steps = []
-        
-        # Step 1: Document Search
-        doc_results = await self._search_documents(query.question)
-        workflow_steps.append({
-            "step": "document_search",
-            "results": doc_results
-        })
-        
-        # Step 2: Web Search (if needed)
-        if query.depth in ["medium", "deep"]:
-            web_results = await self._web_search(query.question)
-            workflow_steps.append({
-                "step": "web_search", 
-                "results": web_results
-            })
-        
-        # Step 3: Synthesis
-        synthesis = await self._synthesize_findings(query, workflow_steps)
-        
-        return {
-            "query": query.question,
-            "workflow_steps": workflow_steps,
-            "synthesis": synthesis,
-            "sources": self._extract_sources(workflow_steps)
-        }
-        
-    async def _search_documents(self, query: str) -> List[Dict[str, Any]]:
-        """Search local document collection"""
-        results = self.vector_store.similarity_search(query, k=5)
-        return results
-        
-    async def _web_search(self, query: str) -> List[Dict[str, Any]]:
-        """Perform web search"""
-        # Implementation depends on your web search tool
-        # This is a placeholder
-        return [{"content": "Web search result", "url": "https://example.com"}]
-        
-    async def _synthesize_findings(self, query: ResearchQuery, workflow_steps: List[Dict]) -> str:
-        """Synthesize findings using LLM"""
-        context = self._build_context(workflow_steps)
-        
-        prompt = f"""
-        Based on the following research findings, provide a comprehensive answer to the question: {query.question}
-        
-        Context:
-        {context}
-        
-        Please provide a well-structured response with:
-        1. Direct answer to the question
-        2. Supporting evidence
-        3. Potential limitations or gaps
-        4. Suggestions for further research
-        
-        Answer:
-        """
-        
-        response = self.model_manager.generate_response(
-            "qwen2.5-14b-instruct",  # or your preferred model
-            prompt,
-            max_length=1024,
-            temperature=0.3
-        )
-        
-        return response
-        
-    def _build_context(self, workflow_steps: List[Dict]) -> str:
-        """Build context from workflow results"""
-        context_parts = []
-        
-        for step in workflow_steps:
-            if step["step"] == "document_search":
-                context_parts.append("Document Sources:")
-                for result in step["results"]:
-                    context_parts.append(f"- {result['content'][:500]}...")
-                    
-            elif step["step"] == "web_search":
-                context_parts.append("Web Sources:")
-                for result in step["results"]:
-                    context_parts.append(f"- {result['content'][:500]}...")
-                    
-        return "\n".join(context_parts)
-        
-    def _extract_sources(self, workflow_steps: List[Dict]) -> List[str]:
-        """Extract source references"""
-        sources = []
-        for step in workflow_steps:
-            for result in step["results"]:
-                if "source" in result:
-                    sources.append(result["source"])
-                elif "url" in result:
-                    sources.append(result["url"])
-        return list(set(sources))
+    async def process_documents(self, documents: List[str], metadata: List[Dict] = None):
+        """Process and store documents in the vector store"""
+        try:
+            model = self.model_manager.get_model("all-MiniLM-L6-v2")
+            if not model:
+                raise Exception("Model not loaded")
+            
+            # Generate embeddings
+            embeddings = model.encode(documents)
+            
+            # Add to vector store
+            self.vector_store.add_documents(documents, embeddings, metadata)
+            
+            self.logger.info(f"Processed {len(documents)} documents")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to process documents: {e}")
+            return False
+    
+    async def query(self, query: str, max_results: int = 5):
+        """Query the vector store with a text query"""
+        try:
+            model = self.model_manager.get_model("all-MiniLM-L6-v2")
+            if not model:
+                raise Exception("Model not loaded")
+            
+            # Generate query embedding
+            query_embedding = model.encode([query])
+            
+            # Search vector store
+            results = self.vector_store.search(query_embedding, k=max_results)
+            
+            return results
+            
+        except Exception as e:
+            self.logger.error(f"Failed to query: {e}")
+            return []

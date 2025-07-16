@@ -2,14 +2,15 @@
 import torch
 import psutil
 from typing import Dict, Any
-import nvidia_ml_py as nvml
+# import nvidia_ml_py as nvml
+import pynvml
 
 class GPUManager:
     """Manage GPU resources and optimization"""
     
     def __init__(self):
         if torch.cuda.is_available():
-            nvml.nvmlInit()
+            pynvml.pynvml()
             self.device_count = torch.cuda.device_count()
         else:
             self.device_count = 0
@@ -22,9 +23,9 @@ class GPUManager:
         info = {"gpu_available": True, "devices": []}
         
         for i in range(self.device_count):
-            handle = nvml.nvmlDeviceGetHandleByIndex(i)
-            name = nvml.nvmlDeviceGetName(handle).decode()
-            mem_info = nvml.nvmlDeviceGetMemoryInfo(handle)
+            handle = pynvml.pynvml(i)
+            name = pynvml.nvmlDeviceGetName(handle).decode()
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
             
             info["devices"].append({
                 "id": i,

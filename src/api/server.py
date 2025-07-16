@@ -1,49 +1,25 @@
-# src/api/server.py
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+import uvicorn
+import time
+import datetime
+from typing import List, Dict, Any, Optional
+import logging
+import json
 import asyncio
-from contextlib import asynccontextmanager
 
-from src.agents.research_agent import ResearchAgent, ResearchQuery
-from src.models.model_manager import ModelManager
-from src.rag.vector_store import VectorStore
-from src.utils.monitoring import PerformanceMonitor
+# Import the fixed classes
+# from research_agent import ModelManager, VectorStore, ResearchAgent
+from ..agents.research_agent import ModelManager, VectorStore, ResearchAgent
 
-# Global components
-components = {}
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    config = {"base_model": "Qwen/Qwen2.5-14B-Instruct"}
-    
-    components["model_manager"] = ModelManager(config)
-    components["vector_store"] = VectorStore()
-    components["monitor"] = PerformanceMonitor()
-    
-    # Load base model
-    components["model_manager"].load_base_model(config["base_model"])
-    
-    components["agent"] = ResearchAgent(
-        components["model_manager"],
-        components["vector_store"]
-    )
-    
-    yield
-    
-    # Shutdown cleanup
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+app = FastAPI(title="Research Agent API", version="1.0.0")
 
-app = FastAPI(
-    title="MCP Research Agent API",
-    description="Intelligent research assistant with RAG and LLM capabilities",
-    version="1.0.0",
-    lifespan=lifespan
-)
-
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -52,69 +28,138 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Request/Response models
-class ResearchRequest(BaseModel):
-    question: str
-    context: Optional[str] = None
-    depth: str = "medium"
-    sources: Optional[List[str]] = None
+# Initialize components
+research_agent = ResearchAgent()
 
-class ResearchResponse(BaseModel):
-    question: str
-    answer: str
-    sources: List[str]
-    workflow_steps: List[dict]
+# Pydantic models for request/response
+class QueryRequest(BaseModel):
+    query: str
+    max_results: int = 5
+
+class QueryResponse(BaseModel):
+    results: List[Dict[str, Any]]
     processing_time: float
+    document_count: int
 
-@app.post("/research", response_model=ResearchResponse)
-async def research_endpoint(request: ResearchRequest):
-    """Main research endpoint"""
+class DocumentRequest(BaseModel):
+    documents: List[str]
+    metadata: Optional[List[Dict[str, Any]]] = None
+
+class DocumentResponse(BaseModel):
+    success: bool
+    message: str
+    processed_count: int
+
+class HealthResponse(BaseModel):
+    status: str
+    timestamp: str
+    torch_available: bool
+    document_count: int
+    models_loaded: List[str]
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize models on startup"""
+    logger.info("Starting up Research Agent API...")
+    success = await research_agent.initialize()
+    if not success:
+        logger.error("Failed to initialize Research Agent")
+        raise RuntimeError("Failed to initialize Research Agent")
+    logger.info("Research Agent API started successfully")
+
+@app.post("/documents", response_model=DocumentResponse)
+async def add_documents(request: DocumentRequest):
+    """Add documents to the vector store"""
     try:
-        agent = components["agent"]
-        monitor = components["monitor"]
-        
-        query = ResearchQuery(
-            question=request.question,
-            context=request.context,
-            depth=request.depth,
-            sources=request.sources or []
+        success = await research_agent.process_documents(
+            request.documents, 
+            request.metadata
         )
         
-        # Process with monitoring
-        start_time = time.time()
-        result = await agent.process_research_query(query)
+        if success:
+            return DocumentResponse(
+                success=True,
+                message="Documents processed successfully",
+                processed_count=len(request.documents)
+            )
+        else:
+            raise HTTPException(status_code=500, detail="Failed to process documents")
+            
+    except Exception as e:
+        logger.error(f"Error processing documents: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/query", response_model=QueryResponse)
+async def query_documents(request: QueryRequest):
+    """Query documents using semantic search"""
+    start_time = time.time()
+    
+    try:
+        results = await research_agent.query(request.query, request.max_results)
+        
         processing_time = time.time() - start_time
         
-        return ResearchResponse(
-            question=request.question,
-            answer=result["synthesis"],
-            sources=result["sources"],
-            workflow_steps=result["workflow_steps"],
-            processing_time=processing_time
+        return QueryResponse(
+            results=results,
+            processing_time=processing_time,
+            document_count=research_agent.vector_store.get_document_count()
         )
         
     except Exception as e:
+        logger.error(f"Error querying documents: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/health")
+@app.delete("/documents")
+async def clear_documents():
+    """Clear all documents from the vector store"""
+    try:
+        research_agent.vector_store.clear()
+        return {"success": True, "message": "All documents cleared"}
+    except Exception as e:
+        logger.error(f"Error clearing documents: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    try:
+        import torch
+        torch_available = torch.cuda.is_available()
+    except ImportError:
+        torch_available = False
+    
+    return HealthResponse(
+        status="healthy",
+        timestamp=datetime.datetime.now().isoformat(),
+        torch_available=torch_available,
+        document_count=research_agent.vector_store.get_document_count(),
+        models_loaded=research_agent.model_manager.list_models()
+    )
 
-@app.get("/metrics")
-async def get_metrics():
-    """Get performance metrics"""
-    monitor = components["monitor"]
-    return monitor.get_average_metrics()
+@app.get("/models")
+async def list_models():
+    """List loaded models"""
+    return {
+        "loaded_models": research_agent.model_manager.list_models(),
+        "available_models": [
+            "all-MiniLM-L6-v2",
+            "all-mpnet-base-v2",
+            "distilbert-base-uncased"
+        ]
+    }
 
-@app.post("/ingest")
-async def ingest_documents(background_tasks: BackgroundTasks):
-    """Ingest new documents"""
-    # Implementation for document ingestion
-    background_tasks.add_task(ingest_documents_task)
-    return {"message": "Document ingestion started"}
+@app.post("/models/{model_name}")
+async def load_model(model_name: str, model_type: str = "sentence-transformer"):
+    """Load a specific model"""
+    try:
+        model = research_agent.model_manager.load_model(model_name, model_type)
+        if model:
+            return {"success": True, "message": f"Model {model_name} loaded successfully"}
+        else:
+            raise HTTPException(status_code=500, detail=f"Failed to load model {model_name}")
+    except Exception as e:
+        logger.error(f"Error loading model {model_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-async def ingest_documents_task():
-    """Background task for document ingestion"""
-    # Implementation here
-    pass
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
