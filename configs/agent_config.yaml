@@ -1,0 +1,33 @@
+# configs/agent_config.yaml
+agent:
+  name: "ResearchAgent"
+  version: "1.0.0"
+  description: "MCP agent for research tasks"
+
+workflows:
+  research:
+    max_steps: 10
+    timeout: 300
+    depth_levels:
+      shallow: ["document_search"]
+      medium: ["document_search", "web_search"]
+      deep: ["document_search", "web_search", "analysis", "synthesis"]
+
+tools:
+  web_search:
+    enabled: true
+    max_results: 5
+    timeout: 30
+  
+  document_analysis:
+    enabled: true
+    max_length: 4000
+  
+  citation_manager:
+    enabled: true
+    format: "apa"
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  cors_origins: ["*"]
